@@ -16,35 +16,36 @@
 ]]
 
 local api = {}
-local https = require('ssl.https')
-local multipart = require('multipart-post')
-local ltn12 = require('ltn12')
-local json = require('dkjson')
+local log = require('log')
+local json = require('json')
+local fiber = require('fiber')
+local https = require('http.client').new()
+local multipart = require('telegram-bot.multipart')
 
-function api.configure(token, debug)
+function api.configure(token)
     if not token or type(token) ~= 'string' then
-        token = nil
+        return false, 'Please specify your bot API token you received from @BotFather!'
     end
-    api.debug = debug and true or false
-    api.token = assert(token, 'Please specify your bot API token you received from @BotFather!')
-    repeat
-        api.info = api.get_me()
-    until api.info.result
-    api.info = api.info.result
-    api.info.name = api.info.first_name
+
+    api.token = token
+    local info, err = api.get_me()
+    if not info then
+        return false, err
+    end
+
+    api.info = info.result
+    api.info.name = info.result.first_name
+    log.info('Telegram bot authorized: @%s', api.info.name)
     return api
 end
 
-function api.request(endpoint, parameters, file)
+function api.request(endpoint, parameters, file, timeout)
     assert(endpoint, 'You must specify an endpoint to make this request to!')
-    parameters = parameters or {}
+    parameters = setmetatable(parameters or {}, {__tostring = json.encode})
     for k, v in pairs(parameters) do
         parameters[k] = tostring(v)
     end
-    if api.debug then
-        local output = json.encode(parameters, { ['indent'] = true })
-        print(output)
-    end
+    log.verbose('%s: %s', endpoint, parameters)
     if file and next(file) ~= nil then
         local file_type, file_name = next(file)
         local file_res = io.open(file_name, 'r')
@@ -59,49 +60,46 @@ function api.request(endpoint, parameters, file)
         end
     end
     parameters = next(parameters) == nil and { '' } or parameters
-    local response = {}
     local body, boundary = multipart.encode(parameters)
-    local success, res = https.request(
+    local resp = https:post(
+        'https://api.telegram.org/bot' .. api.token .. endpoint,
+        body,
         {
-            ['url'] = endpoint,
-            ['method'] = 'POST',
             ['headers'] = {
                 ['Content-Type'] = 'multipart/form-data; boundary=' .. boundary,
-                ['Content-Length'] = #body
             },
-            ['source'] = ltn12.source.string(body),
-            ['sink'] = ltn12.sink.table(response)
+            verify_peer = true,
+            timeout = timeout,
+            keepalive_idle = 30,
+            keepalive_interval = 30,
         }
     )
-    if not success then
-        print('Connection error [' .. res .. ']')
-        return false, res
+
+    local ok, jdat = pcall(json.decode, resp.body)
+    if not ok then
+        return false, string.format(
+            'Request %s failed [%s]: %s',
+            endpoint, resp.status, resp.reason or 'No reason'
+        )
     end
-    local jstr = table.concat(response)
-    local jdat = json.decode(jstr)
-    if not jdat then
-        return false, res
-    elseif not jdat.ok then
-        local output = '\n' .. jdat.description .. ' [' .. jdat.error_code .. ']\n\nPayload: '
-        output = output .. json.encode(parameters, { ['indent'] = true }) .. '\n'
-        print(output)
-        return false, jdat
+    if not jdat.ok then
+        log.error('%s failed: %s', endpoint, jdat.description)
+        return false, string.format(
+            'Request %s failed [%s]: %s',
+            endpoint, jdat.error_code, jdat.description
+        )
     end
-    return jdat, code
+    return jdat
 end
 
 function api.get_me()
-    return api.request('https://api.telegram.org/bot' .. api.token .. '/getMe')
+    return api.request('/getMe', nil, nil, 3)
 end
 
-function api.get_updates(timeout, offset, limit, allowed_updates, use_beta_endpoint) -- https://core.telegram.org/bots/api#getupdates
+function api.get_updates(timeout, offset, limit, allowed_updates) -- https://core.telegram.org/bots/api#getupdates
     allowed_updates = type(allowed_updates) == 'table' and json.encode(allowed_updates) or allowed_updates
     return api.request(
-        string.format(
-            'https://api.telegram.org/%sbot%s/getUpdates',
-            use_beta_endpoint and 'beta/' or '',
-            api.token
-        ),
+        '/getUpdates',
         {
             ['timeout'] = timeout,
             ['offset'] = offset,
@@ -116,7 +114,7 @@ function api.send_message(message, text, parse_mode, disable_web_page_preview, d
     message = (type(message) == 'table' and message.chat and message.chat.id) and message.chat.id or message
     parse_mode = (type(parse_mode) == 'boolean' and parse_mode == true) and 'markdown' or parse_mode
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendMessage',
+        '/sendMessage',
         {
             ['chat_id'] = message,
             ['text'] = text,
@@ -136,7 +134,7 @@ function api.send_reply(message, text, parse_mode, disable_web_page_preview, rep
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     parse_mode = (type(parse_mode) == 'boolean' and parse_mode == true) and 'markdown' or parse_mode
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendMessage',
+        '/sendMessage',
         {
             ['chat_id'] = message.chat.id,
             ['text'] = text,
@@ -151,7 +149,7 @@ end
 
 function api.forward_message(chat_id, from_chat_id, disable_notification, message_id) -- https://core.telegram.org/bots/api#forwardmessage
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/forwardMessage',
+        '/forwardMessage',
         {
             ['chat_id'] = chat_id,
             ['from_chat_id'] = from_chat_id,
@@ -164,7 +162,7 @@ end
 function api.send_photo(chat_id, photo, caption, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#sendphoto
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendPhoto',
+        '/sendPhoto',
         {
             ['chat_id'] = chat_id,
             ['caption'] = caption,
@@ -181,7 +179,7 @@ end
 function api.send_audio(chat_id, audio, caption, duration, performer, title, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#sendaudio
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendAudio',
+        '/sendAudio',
         {
             ['chat_id'] = chat_id,
             ['caption'] = caption,
@@ -199,7 +197,7 @@ end
 function api.send_document(chat_id, document, caption, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#senddocument
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendDocument',
+        '/sendDocument',
         {
             ['chat_id'] = chat_id,
             ['caption'] = caption,
@@ -214,7 +212,7 @@ end
 function api.send_sticker(chat_id, sticker, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#sendsticker
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendSticker',
+        '/sendSticker',
         {
             ['chat_id'] = chat_id,
             ['disable_notification'] = disable_notification,
@@ -228,7 +226,7 @@ end
 function api.send_video(chat_id, video, duration, width, height, caption, supports_streaming, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#sendvideo
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendVideo',
+        '/sendVideo',
         {
             ['chat_id'] = chat_id,
             ['duration'] = duration,
@@ -247,7 +245,7 @@ end
 function api.send_animation(chat_id, animation, duration, width, height, thumb, caption, parse_mode, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#sendanimation
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendAnimation',
+        '/sendAnimation',
         {
             ['chat_id'] = chat_id,
             ['duration'] = duration,
@@ -268,7 +266,7 @@ end
 function api.send_voice(chat_id, voice, caption, duration, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#sendvoice
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendVoice',
+        '/sendVoice',
         {
             ['chat_id'] = chat_id,
             ['caption'] = caption,
@@ -284,7 +282,7 @@ end
 function api.send_video_note(chat_id, video_note, duration, length, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#sendvideonote
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendVideoNote',
+        '/sendVideoNote',
         {
             ['chat_id'] = chat_id,
             ['duration'] = duration,
@@ -299,7 +297,7 @@ end
 
 function api.send_media_group(chat_id, media, disable_notification, reply_to_message_id) -- https://core.telegram.org/bots/api#sendmediagroup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendMediaGroup',
+        '/sendMediaGroup',
         {
             ['chat_id'] = chat_id,
             ['media'] = media,
@@ -312,7 +310,7 @@ end
 function api.send_location(chat_id, latitude, longitude, live_period, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#sendlocation
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendLocation',
+        '/sendLocation',
         {
             ['chat_id'] = chat_id,
             ['latitude'] = latitude,
@@ -328,7 +326,7 @@ end
 function api.edit_message_live_location(chat_id, message_id, inline_message_id, latitude, longitude, reply_markup) -- https://core.telegram.org/bots/api#editmessagelivelocation
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/editMessageLiveLocation',
+        '/editMessageLiveLocation',
         {
             ['chat_id'] = chat_id,
             ['message_id'] = message_id,
@@ -343,7 +341,7 @@ end
 function api.stop_message_live_location(chat_id, message_id, inline_message_id, reply_markup) -- https://core.telegram.org/bots/api#stopmessagelivelocation
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/stopMessageLiveLocation',
+        '/stopMessageLiveLocation',
         {
             ['chat_id'] = chat_id,
             ['message_id'] = message_id,
@@ -356,7 +354,7 @@ end
 function api.send_venue(chat_id, latitude, longitude, title, address, foursquare_id, foursquare_type, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#sendvenue
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendVenue',
+        '/sendVenue',
         {
             ['chat_id'] = chat_id,
             ['latitude'] = latitude,
@@ -375,7 +373,7 @@ end
 function api.send_contact(chat_id, phone_number, first_name, last_name, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#sendcontact
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendContact',
+        '/sendContact',
         {
             ['chat_id'] = chat_id,
             ['phone_number'] = phone_number,
@@ -390,7 +388,7 @@ end
 
 function api.send_chat_action(chat_id, action) -- https://core.telegram.org/bots/api#sendchataction
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendChatAction',
+        '/sendChatAction',
         {
             ['chat_id'] = chat_id,
             ['action'] = action or 'typing' -- Fallback to `typing` as the default action.
@@ -400,7 +398,7 @@ end
 
 function api.get_user_profile_photos(user_id, offset, limit) -- https://core.telegram.org/bots/api#getuserprofilephotos
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/getUserProfilePhotos',
+        '/getUserProfilePhotos',
         {
             ['user_id'] = user_id,
             ['offset'] = offset,
@@ -411,14 +409,14 @@ end
 
 function api.get_file(file_id) -- https://core.telegram.org/bots/api#getfile
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/getFile',
+        '/getFile',
         { ['file_id'] = file_id }
     )
 end
 
 function api.ban_chat_member(chat_id, user_id, until_date) -- https://core.telegram.org/bots/api#kickchatmember
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/kickChatMember',
+        '/kickChatMember',
         {
             ['chat_id'] = chat_id,
             ['user_id'] = user_id,
@@ -429,7 +427,7 @@ end
 
 function api.kick_chat_member(chat_id, user_id)
     local success = api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/kickChatMember',
+        '/kickChatMember',
         {
             ['chat_id'] = chat_id,
             ['user_id'] = user_id
@@ -446,7 +444,7 @@ function api.unban_chat_member(chat_id, user_id) -- https://core.telegram.org/bo
     for i = 1, 3 do -- Repeat 3 times to ensure the user was unbanned (I've encountered issues before so
     -- this is for precautionary measures.)
         success = api.request(
-            'https://api.telegram.org/bot' .. api.token .. '/unbanChatMember',
+            '/unbanChatMember',
             {
                 ['chat_id'] = chat_id,
                 ['user_id'] = user_id
@@ -458,7 +456,7 @@ end
 
 function api.restrict_chat_member(chat_id, user_id, until_date, can_send_messages, can_send_media_messages, can_send_other_messages, can_add_web_page_previews) -- https://core.telegram.org/bots/api#restrictchatmember
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/restrictChatMember',
+        '/restrictChatMember',
         {
             ['chat_id'] = chat_id,
             ['user_id'] = user_id,
@@ -473,7 +471,7 @@ end
 
 function api.promote_chat_member(chat_id, user_id, can_change_info, can_post_messages, can_edit_messages, can_delete_messages, can_invite_users, can_restrict_members, can_pin_messages, can_promote_members) -- https://core.telegram.org/bots/api#promotechatmember
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/promoteChatMember',
+        '/promoteChatMember',
         {
             ['chat_id'] = chat_id,
             ['user_id'] = user_id,
@@ -491,14 +489,14 @@ end
 
 function api.export_chat_invite_link(chat_id) -- https://core.telegram.org/bots/api#exportchatinvitelink
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/exportChatInviteLink',
+        '/exportChatInviteLink',
         { ['chat_id'] = chat_id }
     )
 end
 
 function api.set_chat_photo(chat_id, photo) -- https://core.telegram.org/bots/api#setchatphoto
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/setChatPhoto',
+        '/setChatPhoto',
         { ['chat_id'] = chat_id },
         { ['photo'] = photo }
     )
@@ -506,14 +504,14 @@ end
 
 function api.delete_chat_photo(chat_id) -- https://core.telegram.org/bots/api#deletechatphoto
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/deleteChatPhoto',
+        '/deleteChatPhoto',
         { ['chat_id'] = chat_id }
     )
 end
 
 function api.set_chat_title(chat_id, title) -- https://core.telegram.org/bots/api#setchattitle
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/setChatTitle',
+        '/setChatTitle',
         {
             ['chat_id'] = chat_id,
             ['title'] = title
@@ -523,7 +521,7 @@ end
 
 function api.set_chat_description(chat_id, description) -- https://core.telegram.org/bots/api#setchatdescription
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/setChatDescription',
+        '/setChatDescription',
         {
             ['chat_id'] = chat_id,
             ['description'] = description
@@ -533,7 +531,7 @@ end
 
 function api.pin_chat_message(chat_id, message_id, disable_notification) -- https://core.telegram.org/bots/api#pinchatmessage
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/pinChatMessage',
+        '/pinChatMessage',
         {
             ['chat_id'] = chat_id,
             ['message_id'] = message_id,
@@ -544,35 +542,35 @@ end
 
 function api.unpin_chat_message(chat_id) -- https://core.telegram.org/bots/api#unpinchatmessage
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/unpinChatMessage',
+        '/unpinChatMessage',
         { ['chat_id'] = chat_id }
     )
 end
 
 function api.leave_chat(chat_id) -- https://core.telegram.org/bots/api#leavechat
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/leaveChat',
+        '/leaveChat',
         { ['chat_id'] = chat_id }
     )
 end
 
 function api.get_chat_administrators(chat_id) -- https://core.telegram.org/bots/api#getchatadministrators
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/getChatAdministrators',
+        '/getChatAdministrators',
         { ['chat_id'] = chat_id }
     )
 end
 
 function api.get_chat_members_count(chat_id) -- https://core.telegram.org/bots/api#getchatmemberscount
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/getChatMembersCount',
+        '/getChatMembersCount',
         { ['chat_id'] = chat_id }
     )
 end
 
 function api.get_chat_member(chat_id, user_id) -- https://core.telegram.org/bots/api#getchatmember
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/getChatMember',
+        '/getChatMember',
         {
             ['chat_id'] = chat_id,
             ['user_id'] = user_id
@@ -582,7 +580,7 @@ end
 
 function api.set_chat_sticker_set(chat_id, sticker_set_name) -- https://core.telegram.org/bots/api#setchatstickerset
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/setChatStickerSet',
+        '/setChatStickerSet',
         {
             ['chat_id'] = chat_id,
             ['sticker_set_name'] = sticker_set_name
@@ -592,14 +590,14 @@ end
 
 function api.delete_chat_sticker_set(chat_id) -- https://core.telegram.org/bots/api#deletechatstickerset
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/deleteChatStickerSet',
+        '/deleteChatStickerSet',
         { ['chat_id'] = chat_id }
     )
 end
 
 function api.answer_callback_query(callback_query_id, text, show_alert, url, cache_time) -- https://core.telegram.org/bots/api#answercallbackquery
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/answerCallbackQuery',
+        '/answerCallbackQuery',
         {
             ['callback_query_id'] = callback_query_id,
             ['text'] = text,
@@ -614,7 +612,7 @@ function api.edit_message_text(chat_id, message_id, text, parse_mode, disable_we
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     parse_mode = (type(parse_mode) == 'boolean' and parse_mode == true) and 'markdown' or parse_mode
     local success = api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/editMessageText',
+        '/editMessageText',
         {
             ['chat_id'] = chat_id,
             ['message_id'] = message_id,
@@ -628,7 +626,7 @@ function api.edit_message_text(chat_id, message_id, text, parse_mode, disable_we
     if not success
     then
         return api.request(
-            'https://api.telegram.org/bot' .. api.token .. '/editMessageText',
+            '/editMessageText',
             {
                 ['chat_id'] = chat_id,
                 ['message_id'] = inline_message_id,
@@ -646,7 +644,7 @@ end
 function api.edit_message_caption(chat_id, message_id, caption, reply_markup, inline_message_id) -- https://core.telegram.org/bots/api#editmessagecaption
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     local success = api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/editMessageCaption',
+        '/editMessageCaption',
         {
             ['chat_id'] = chat_id,
             ['message_id'] = message_id,
@@ -657,7 +655,7 @@ function api.edit_message_caption(chat_id, message_id, caption, reply_markup, in
     )
     if not success then
         return api.request(
-            'https://api.telegram.org/bot' .. api.token .. '/editMessageCaption',
+            '/editMessageCaption',
             {
                 ['chat_id'] = chat_id,
                 ['message_id'] = inline_message_id,
@@ -673,7 +671,7 @@ end
 function api.edit_message_media(chat_id, message_id, media, reply_markup, inline_message_id) -- https://core.telegram.org/bots/api#editmessagemedia
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     local success = api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/editMessageMedia',
+        '/editMessageMedia',
         {
             ['chat_id'] = chat_id,
             ['message_id'] = message_id,
@@ -684,7 +682,7 @@ function api.edit_message_media(chat_id, message_id, media, reply_markup, inline
     )
     if not success then
         return api.request(
-            'https://api.telegram.org/bot' .. api.token .. '/editMessageMedia',
+            '/editMessageMedia',
             {
                 ['chat_id'] = chat_id,
                 ['message_id'] = inline_message_id,
@@ -700,7 +698,7 @@ end
 function api.edit_message_reply_markup(chat_id, message_id, inline_message_id, reply_markup) -- https://core.telegram.org/bots/api#editmessagereplymarkup
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     local success = api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/editMessageReplyMarkup',
+        '/editMessageReplyMarkup',
         {
             ['chat_id'] = chat_id,
             ['message_id'] = message_id,
@@ -710,7 +708,7 @@ function api.edit_message_reply_markup(chat_id, message_id, inline_message_id, r
     )
     if not success then
         return api.request(
-            'https://api.telegram.org/bot' .. api.token .. '/editMessageReplyMarkup',
+            '/editMessageReplyMarkup',
             {
                 ['chat_id'] = chat_id,
                 ['message_id'] = inline_message_id,
@@ -724,7 +722,7 @@ end
 
 function api.delete_message(chat_id, message_id) -- https://core.telegram.org/bots/api#deletemessage
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/deleteMessage',
+        '/deleteMessage',
         {
             ['chat_id'] = chat_id,
             ['message_id'] = message_id
@@ -734,14 +732,14 @@ end
 
 function api.get_sticker_set(name) -- https://core.telegram.org/bots/api#getstickerset
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/getStickerSet',
+        '/getStickerSet',
         { ['name'] = name }
     )
 end
 
 function api.upload_sticker_file(user_id, png_sticker) -- https://core.telegram.org/bots/api#uploadstickerfile
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/uploadStickerFile',
+        '/uploadStickerFile',
         { ['user_id'] = user_id },
         { ['png_sticker'] = png_sticker }
     )
@@ -750,7 +748,7 @@ end
 function api.create_new_sticker_set(user_id, name, title, png_sticker, emojis, contains_masks, mask_position) -- https://core.telegram.org/bots/api#createnewstickerset
     mask_position = type(mask_position) == 'table' and json.encode(mask_position) or mask_position
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/createNewStickerSet',
+        '/createNewStickerSet',
         {
             ['user_id'] = user_id,
             ['name'] = name,
@@ -766,7 +764,7 @@ end
 function api.add_sticker_to_set(user_id, name, png_sticker, emojis, mask_position) -- https://core.telegram.org/bots/api#addstickertoset
     mask_position = type(mask_position) == 'table' and json.encode(mask_position) or mask_position
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/addStickerToSet',
+        '/addStickerToSet',
         {
             ['user_id'] = user_id,
             ['name'] = name,
@@ -779,7 +777,7 @@ end
 
 function api.set_sticker_position_in_set(sticker, position) -- https://core.telegram.org/bots/api#setstickerpositioninset
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/setStickerPositionInSet',
+        '/setStickerPositionInSet',
         {
             ['sticker'] = sticker,
             ['position'] = position
@@ -789,7 +787,7 @@ end
 
 function api.delete_sticker_from_set(sticker) -- https://core.telegram.org/bots/api#deletestickerfromset
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/deleteStickerFromSet',
+        '/deleteStickerFromSet',
         { ['sticker'] = sticker }
     )
 end
@@ -802,7 +800,7 @@ function api.answer_inline_query(inline_query_id, results, cache_time, is_person
         results = json.encode(results)
     end
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/answerInlineQuery',
+        '/answerInlineQuery',
         {
             ['inline_query_id'] = inline_query_id,
             ['results'] = results,
@@ -818,7 +816,7 @@ end
 function api.send_game(chat_id, game_short_name, disable_notification, reply_to_message_id, reply_markup) -- https://core.telegram.org/bots/api#sendgame
     reply_markup = type(reply_markup) == 'table' and json.encode(reply_markup) or reply_markup
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendGame',
+        '/sendGame',
         {
             ['chat_id'] = chat_id,
             ['game_short_name'] = game_short_name,
@@ -831,7 +829,7 @@ end
 
 function api.set_game_score(chat_id, user_id, message_id, score, force, disable_edit_message, inline_message_id) -- https://core.telegram.org/bots/api#setgamescore
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/setGameScore',
+        '/setGameScore',
         {
             ['user_id'] = user_id,
             ['score'] = score,
@@ -846,7 +844,7 @@ end
 
 function api.get_game_high_scores(chat_id, user_id, message_id, inline_message_id) -- https://core.telegram.org/bots/api#getgamehighscores
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/getGameHighScores',
+        '/getGameHighScores',
         {
             ['user_id'] = user_id,
             ['chat_id'] = chat_id,
@@ -858,14 +856,14 @@ end
 
 function api.get_chat(chat_id) -- https://core.telegram.org/bots/api#getchat
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/getChat',
+        '/getChat',
         { ['chat_id'] = chat_id }
     )
 end
 
 function api.send_invoice(chat_id, title, description, payload, provider_token, start_parameter, currency, prices, provider_data, photo_url, photo_size, photo_width, photo_height, need_name, need_phone_number, need_email, need_shipping_address, is_flexible, disable_notification, reply_to_message_id, reply_markup)
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/sendInvoice',
+        '/sendInvoice',
         {
             ['chat_id'] = chat_id,
             ['title'] = title,
@@ -894,7 +892,7 @@ end
 
 function api.answer_shipping_query(shipping_query_id, ok, shipping_options, error_message)
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/answerShippingQuery',
+        '/answerShippingQuery',
         {
             ['shipping_query_id'] = shipping_query_id,
             ['ok'] = ok,
@@ -906,7 +904,7 @@ end
 
 function api.answer_pre_checkout_query(pre_checkout_query_id, ok, error_message)
     return api.request(
-        'https://api.telegram.org/bot' .. api.token .. '/answerPreCheckoutQuery',
+        '/answerPreCheckoutQuery',
         {
             ['pre_checkout_query_id'] = pre_checkout_query_id,
             ['ok'] = ok,
@@ -972,12 +970,13 @@ function api.process_update(update)
     return false
 end
 
-function api.run(limit, timeout, offset, allowed_updates, use_beta_endpoint)
+local function _run(limit, timeout, offset, allowed_updates)
     limit = tonumber(limit) ~= nil and limit or 1
     timeout = tonumber(timeout) ~= nil and timeout or 0
     offset = tonumber(offset) ~= nil and offset or 0
+    log.info('Telegram bot running...')
     while true do
-        local updates = api.get_updates(timeout, offset, limit, allowed_updates, use_beta_endpoint)
+        local updates = api.get_updates(timeout, offset, limit, allowed_updates)
         if updates and type(updates) == 'table' and updates.result then
             for k, v in pairs(updates.result) do
                 api.process_update(v)
@@ -987,6 +986,13 @@ function api.run(limit, timeout, offset, allowed_updates, use_beta_endpoint)
     end
     return false
 end
+
+function api.run()
+    api._fiber = fiber.new(_run, 100, 10)
+    api._fiber:name('telegram-bot')
+    return
+end
+
 
 function api.input_text_message_content(message_text, parse_mode, disable_web_page_preview, encoded)
     parse_mode = (type(parse_mode) == 'boolean' and parse_mode == true) and 'markdown' or parse_mode
