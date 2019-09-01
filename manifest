@@ -1,0 +1,11 @@
+commands = {}
+modules = {}
+repository = {
+   ["telegram-bot"] = {
+      ["scm-1"] = {
+         {
+            arch = "rockspec"
+         }
+      }
+   }
+}
