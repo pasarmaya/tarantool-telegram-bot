@@ -24,6 +24,7 @@ supported_platforms = {
 dependencies = {
     'lua >= 5.1',
     'tarantool',
+    'errors == 2.1.1-1',
 }
 
 build = {

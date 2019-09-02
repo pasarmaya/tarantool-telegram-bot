@@ -19,6 +19,7 @@ local api = {}
 local log = require('log')
 local json = require('json')
 local fiber = require('fiber')
+local errors = require('errors')
 local https = require('http.client').new()
 local multipart = require('telegram-bot.multipart')
 
@@ -93,7 +94,7 @@ function api.request(endpoint, parameters, file, timeout)
 end
 
 function api.get_me()
-    return api.request('/getMe', nil, nil, 3)
+    return api.request('/getMe', nil, nil, 30)
 end
 
 function api.get_updates(timeout, offset, limit, allowed_updates) -- https://core.telegram.org/bots/api#getupdates
@@ -979,7 +980,10 @@ local function _run(limit, timeout, offset, allowed_updates)
         local updates = api.get_updates(timeout, offset, limit, allowed_updates)
         if updates and type(updates) == 'table' and updates.result then
             for k, v in pairs(updates.result) do
-                api.process_update(v)
+                local _, err = errors.pcall('TelegramHandlerError', api.process_update, v)
+                if err ~= nil then
+                    log.error('-> %s', err)
+                end
                 offset = v.update_id + 1
             end
         end
