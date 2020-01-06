@@ -976,7 +976,9 @@ local function _run(limit, timeout, offset, allowed_updates)
     offset = tonumber(offset) ~= nil and offset or 0
     log.info('Telegram bot running...')
     while true do
-        local updates = api.get_updates(timeout, offset, limit, allowed_updates)
+        local updates, err = errors.pcall('GetUpdatesError', api.get_updates,
+            timeout, offset, limit, allowed_updates
+        )
         if updates and type(updates) == 'table' and updates.result then
             for k, v in pairs(updates.result) do
                 local _, err = errors.pcall('TelegramHandlerError', api.process_update, v)
@@ -985,6 +987,8 @@ local function _run(limit, timeout, offset, allowed_updates)
                 end
                 offset = v.update_id + 1
             end
+        else
+            log.error('-> %s', err)
         end
     end
     return false
