@@ -35,8 +35,7 @@ function api.configure(token)
     end
 
     api.info = info.result
-    api.info.name = info.result.first_name
-    log.info('Telegram bot authorized: @%s', api.info.name)
+    log.info('Telegram bot authorized: @%s', api.info.username)
     return api
 end
 
